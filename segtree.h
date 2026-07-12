@@ -43,7 +43,7 @@
  * ================================================================ */
 
 #define ST_MAGIC        0x54474553  /* SegmentTree */
-#define ST_VERSION      1
+#define ST_VERSION      2            /* 2: node gained assign lazy + gcd/product aggregates */
 #define ST_ERR_BUFLEN   256
 #ifndef ST_READER_SLOTS
 #define ST_READER_SLOTS 1024         /* max concurrent reader processes for dead-process recovery */
@@ -52,6 +52,10 @@
 #define ST_MAX_N        0x1000000ULL     /* 2^24 positions cap */
 #define ST_IDENTITY_MIN INT64_MAX        /* min identity (padding leaves / empty range) */
 #define ST_IDENTITY_MAX INT64_MIN        /* max identity */
+
+/* StNode.flags bits (weighted with the assign lazy + product-overflow marker) */
+#define ST_F_HAS_ASSIGN 0x1U             /* node has a pending range-assign (lazy) */
+#define ST_F_PROD_OVF   0x2U             /* node's product overflowed int64 (unusable) */
 
 #define ST_ERR(fmt, ...) do { if (errbuf) snprintf(errbuf, ST_ERR_BUFLEN, fmt, ##__VA_ARGS__); } while (0)
 
@@ -73,7 +77,7 @@ typedef struct {
 
 struct StHeader {
     uint32_t magic, version;          /* 0,4 */
-    uint32_t _pad0;                   /* 8 */
+    uint32_t add_used;                /* 8  set once any range_add runs -> gcd/product gated off */
     uint32_t _pad1;                   /* 12 */
     uint64_t n;                       /* 16  number of positions (leaves in use) */
     uint64_t size;                    /* 24  next_pow2(n): leaves in the padded tree */
@@ -91,16 +95,23 @@ typedef struct StHeader StHeader;
 
 _Static_assert(sizeof(StHeader) == 256, "StHeader must be 256 bytes");
 
-/* One segment-tree node: the sum/min/max aggregate of its covered range, plus a
- * pending "range add" (lazy) delta not yet pushed to its children.  A node's own
- * sum/min/max already include its own lazy; only its children are stale by it. */
+/* One segment-tree node: the sum/min/max/gcd/product aggregate of its covered
+ * range, plus pending lazies -- a "range add" delta (lazy) and/or a "range
+ * assign" value (assign, active when flags has ST_F_HAS_ASSIGN).  A node's own
+ * aggregate already includes its own lazies; only its children are stale by them.
+ * gcd/product are exact only while no range_add has ever run (see add_used); an
+ * assigned node stores product as c^cnt, or sets ST_F_PROD_OVF if that overflows. */
 typedef struct {
-    int64_t sum;
-    int64_t min;
-    int64_t max;
-    int64_t lazy;
+    int64_t  sum;
+    int64_t  min;
+    int64_t  max;
+    int64_t  gcd;      /* gcd of |values| in the range (0 identity); valid iff !add_used */
+    int64_t  prod;     /* product of the range (1 identity); unusable if ST_F_PROD_OVF */
+    int64_t  lazy;     /* pending range-add delta (used only when !ST_F_HAS_ASSIGN) */
+    int64_t  assign;   /* pending range-assign value (used when ST_F_HAS_ASSIGN) */
+    uint64_t flags;    /* ST_F_HAS_ASSIGN | ST_F_PROD_OVF */
 } StNode;
-_Static_assert(sizeof(StNode) == 32, "StNode must be 32 bytes");
+_Static_assert(sizeof(StNode) == 64, "StNode must be 64 bytes");
 
 /* ---- Process-local handle ---- */
 
@@ -614,6 +625,7 @@ static inline StHandle *st_setup(void *base, size_t map_size,
 static inline int st_validate_header(const StHeader *hdr, uint64_t file_size) {
     if (hdr->magic != ST_MAGIC) return 0;
     if (hdr->version != ST_VERSION) return 0;
+    if (hdr->add_used > 1) return 0;
     if (hdr->n < ST_MIN_N || hdr->n > ST_MAX_N) return 0;
     if (hdr->size != st_next_pow2_u64(hdr->n)) return 0;
     if (hdr->size == 0 || (hdr->size & (hdr->size - 1)) != 0) return 0;   /* power of two */
@@ -768,52 +780,190 @@ static inline int st_msync(StHandle *h) {
  * inside the mapping.
  * ================================================================ */
 
-/* apply a pending +delta to a node covering `cnt` leaves */
-static inline void st_apply(StNode *nd, int64_t delta, uint64_t cnt) {
-    nd->sum  += delta * (int64_t)cnt;
-    nd->min  += delta;
-    nd->max  += delta;
-    nd->lazy += delta;
+/* gcd of |a|,|b| (INT64_MIN-safe); 0 is the identity, so gcd(0,x) == |x| */
+static inline int64_t st_gcd2(int64_t a, int64_t b) {
+    uint64_t x = a < 0 ? (uint64_t)(-(a + 1)) + 1 : (uint64_t)a;
+    uint64_t y = b < 0 ? (uint64_t)(-(b + 1)) + 1 : (uint64_t)b;
+    while (y) { uint64_t t = x % y; x = y; y = t; }
+    return (int64_t)x;                          /* |gcd| <= max(|a|,|b|) <= INT64_MAX+1; fits when a|b != 0 */
+}
+/* base^exp with signed-overflow detection; returns 1 on overflow, else 0 with *out set */
+static inline int st_ipow_ovf(int64_t base, uint64_t exp, int64_t *out) {
+    int64_t result = 1, b = base;
+    while (exp) {
+        if (exp & 1) { if (__builtin_mul_overflow(result, b, &result)) return 1; }
+        exp >>= 1;
+        if (exp) { if (__builtin_mul_overflow(b, b, &b)) return 1; }
+    }
+    *out = result;
+    return 0;
+}
+/* recompute node nd's product/overflow flag from children a,b.  A range holds a
+ * zero exactly when prod==0 && !PROD_OVF (on overflow prod is zeroed but flagged);
+ * a zero collapses the parent product to 0 regardless of a sibling's overflow. */
+static inline void st_combine_prod(StNode *nd, const StNode *a, const StNode *b) {
+    int azero = !(a->flags & ST_F_PROD_OVF) && a->prod == 0;
+    int bzero = !(b->flags & ST_F_PROD_OVF) && b->prod == 0;
+    if (azero || bzero) { nd->prod = 0; nd->flags &= ~ST_F_PROD_OVF; return; }
+    if ((a->flags & ST_F_PROD_OVF) || (b->flags & ST_F_PROD_OVF) ||
+        __builtin_mul_overflow(a->prod, b->prod, &nd->prod)) {
+        nd->flags |= ST_F_PROD_OVF;
+        nd->prod   = 0;
+    } else {
+        nd->flags &= ~ST_F_PROD_OVF;
+    }
+}
+
+/* apply a pending range-add of +delta to a node covering `cnt` leaves.  Maintains
+ * sum/min/max only; gcd/product are not add-maintainable (gated by add_used). */
+static inline void st_apply_add(StNode *nd, int64_t delta, uint64_t cnt) {
+    nd->sum += delta * (int64_t)cnt;
+    nd->min += delta;
+    nd->max += delta;
+    if (nd->flags & ST_F_HAS_ASSIGN) nd->assign += delta;   /* fold into the pending assign */
+    else                             nd->lazy   += delta;
+}
+
+/* apply a pending range-assign of value `c` to a node covering `cnt` leaves --
+ * a uniform range, so every aggregate is exact. */
+static inline void st_apply_assign(StNode *nd, int64_t c, uint64_t cnt) {
+    nd->sum    = c * (int64_t)cnt;
+    nd->min    = c;
+    nd->max    = c;
+    nd->gcd    = st_gcd2(c, 0);                 /* |c| */
+    nd->lazy   = 0;
+    nd->assign = c;
+    nd->flags  = (nd->flags & ~ST_F_PROD_OVF) | ST_F_HAS_ASSIGN;
+    { int64_t p; if (st_ipow_ovf(c, cnt, &p)) nd->flags |= ST_F_PROD_OVF; else nd->prod = p; }
+}
+
+/* push node v's pending lazy (assign or add) down to both children */
+static inline void st_pushdown(StNode *nodes, uint64_t v, uint64_t lcnt, uint64_t rcnt) {
+    StNode *nd = &nodes[v];
+    if (nd->flags & ST_F_HAS_ASSIGN) {
+        st_apply_assign(&nodes[2*v],     nd->assign, lcnt);
+        st_apply_assign(&nodes[2*v + 1], nd->assign, rcnt);
+        nd->flags &= ~ST_F_HAS_ASSIGN;
+        nd->assign = 0;
+    } else if (nd->lazy) {
+        st_apply_add(&nodes[2*v],     nd->lazy, lcnt);
+        st_apply_add(&nodes[2*v + 1], nd->lazy, rcnt);
+        nd->lazy = 0;
+    }
+}
+
+/* recompute node v's aggregate from its two (freshly updated) children */
+static inline void st_pull(StNode *nodes, uint64_t v) {
+    StNode *nd = &nodes[v], *a = &nodes[2*v], *b = &nodes[2*v + 1];
+    nd->sum = a->sum + b->sum;
+    nd->min = a->min < b->min ? a->min : b->min;
+    nd->max = a->max > b->max ? a->max : b->max;
+    nd->gcd = st_gcd2(a->gcd, b->gcd);
+    st_combine_prod(nd, a, b);
 }
 
 /* range-add delta to [l,r] within node v covering [lo,hi] (caller holds wrlock) */
 static void st_range_add_rec(StNode *nodes, uint64_t v, uint64_t lo, uint64_t hi,
                              uint64_t l, uint64_t r, int64_t delta) {
     if (r < lo || hi < l) return;                              /* disjoint */
-    if (l <= lo && hi <= r) { st_apply(&nodes[v], delta, hi - lo + 1); return; }  /* covered */
+    if (l <= lo && hi <= r) { st_apply_add(&nodes[v], delta, hi - lo + 1); return; }
     uint64_t mid = lo + (hi - lo) / 2;
-    int64_t lz = nodes[v].lazy;                               /* pushdown before recomputing */
-    if (lz) {
-        st_apply(&nodes[2*v],     lz, mid - lo + 1);
-        st_apply(&nodes[2*v + 1], lz, hi - mid);
-        nodes[v].lazy = 0;
-    }
+    st_pushdown(nodes, v, mid - lo + 1, hi - mid);
     st_range_add_rec(nodes, 2*v,     lo,      mid, l, r, delta);
     st_range_add_rec(nodes, 2*v + 1, mid + 1, hi,  l, r, delta);
-    StNode *a = &nodes[2*v], *b = &nodes[2*v + 1];
-    nodes[v].sum = a->sum + b->sum;
-    nodes[v].min = a->min < b->min ? a->min : b->min;
-    nodes[v].max = a->max > b->max ? a->max : b->max;
+    st_pull(nodes, v);
 }
 
-/* accumulate sum/min/max over [l,r] within node v covering [lo,hi], carrying the
- * ancestors' un-pushed lazy in `pending` (read-only; caller holds a lock) */
+/* range-assign value c to [l,r] within node v covering [lo,hi] (caller holds wrlock) */
+static void st_range_assign_rec(StNode *nodes, uint64_t v, uint64_t lo, uint64_t hi,
+                                uint64_t l, uint64_t r, int64_t c) {
+    if (r < lo || hi < l) return;                              /* disjoint */
+    if (l <= lo && hi <= r) { st_apply_assign(&nodes[v], c, hi - lo + 1); return; }
+    uint64_t mid = lo + (hi - lo) / 2;
+    st_pushdown(nodes, v, mid - lo + 1, hi - mid);
+    st_range_assign_rec(nodes, 2*v,     lo,      mid, l, r, c);
+    st_range_assign_rec(nodes, 2*v + 1, mid + 1, hi,  l, r, c);
+    st_pull(nodes, v);
+}
+
+/* Read-only query carry.  Applying a covered node's stored aggregate under the
+ * ancestors' un-pushed lazies gives value = (asg ? av : stored) + ad.  A node's
+ * un-pushed lazy applies to its children, so SHALLOWER lazies are applied LATER
+ * (outermost): the SHALLOWEST assign on the path wins (av), adds ABOVE it still
+ * apply on top (ad), and everything DEEPER than that assign is wiped by it.
+ * Hence: adopt an assign / accumulate an add only while no assign has been seen. */
+typedef struct { int asg; int64_t av; int64_t ad; } StCarry;
+
+static inline StCarry st_carry_descend(StCarry c, const StNode *nd) {
+    if (c.asg) return c;                                          /* outer assign already fixed the value */
+    if (nd->flags & ST_F_HAS_ASSIGN) { c.asg = 1; c.av = nd->assign; }
+    else if (nd->lazy)               { c.ad += nd->lazy; }
+    return c;
+}
+
+/* accumulate sum/min/max over [l,r] (read-only; caller holds a lock) */
 static void st_query_rec(StNode *nodes, uint64_t v, uint64_t lo, uint64_t hi,
-                         uint64_t l, uint64_t r, int64_t pending,
+                         uint64_t l, uint64_t r, StCarry c,
                          int64_t *sum, int64_t *mn, int64_t *mx) {
     if (r < lo || hi < l) return;                             /* disjoint -> identity */
     if (l <= lo && hi <= r) {                                 /* covered */
-        *sum += nodes[v].sum + pending * (int64_t)(hi - lo + 1);
-        int64_t nmin = nodes[v].min + pending;
-        int64_t nmax = nodes[v].max + pending;
+        uint64_t cnt = hi - lo + 1;
+        int64_t s, nmin, nmax;
+        if (c.asg) { int64_t val = c.av + c.ad; s = val * (int64_t)cnt; nmin = nmax = val; }
+        else       { s = nodes[v].sum + c.ad * (int64_t)cnt;
+                     nmin = nodes[v].min + c.ad; nmax = nodes[v].max + c.ad; }
+        *sum += s;
         if (nmin < *mn) *mn = nmin;
         if (nmax > *mx) *mx = nmax;
         return;
     }
     uint64_t mid = lo + (hi - lo) / 2;
-    int64_t newp = pending + nodes[v].lazy;                   /* carry v's un-pushed lazy down */
-    st_query_rec(nodes, 2*v,     lo,      mid, l, r, newp, sum, mn, mx);
-    st_query_rec(nodes, 2*v + 1, mid + 1, hi,  l, r, newp, sum, mn, mx);
+    StCarry cc = st_carry_descend(c, &nodes[v]);
+    st_query_rec(nodes, 2*v,     lo,      mid, l, r, cc, sum, mn, mx);
+    st_query_rec(nodes, 2*v + 1, mid + 1, hi,  l, r, cc, sum, mn, mx);
+}
+
+/* accumulate gcd over [l,r] into *g (read-only; only called with add_used == 0,
+ * so no add lazy exists and the carry is assign-only) */
+static void st_gcd_rec(StNode *nodes, uint64_t v, uint64_t lo, uint64_t hi,
+                       uint64_t l, uint64_t r, StCarry c, int64_t *g) {
+    if (r < lo || hi < l) return;
+    if (l <= lo && hi <= r) {
+        int64_t ng = c.asg ? st_gcd2(c.av, 0) : nodes[v].gcd;
+        *g = st_gcd2(*g, ng);
+        return;
+    }
+    uint64_t mid = lo + (hi - lo) / 2;
+    StCarry cc = st_carry_descend(c, &nodes[v]);
+    st_gcd_rec(nodes, 2*v,     lo,      mid, l, r, cc, g);
+    st_gcd_rec(nodes, 2*v + 1, mid + 1, hi,  l, r, cc, g);
+}
+
+/* multiply product over [l,r] into *p.  Sets *hasz if the range contains a zero
+ * (then the product is 0, whatever any sibling overflow says) and *ovf on a real
+ * int64 overflow with no zero.  Does NOT short-circuit on *ovf -- a later zero
+ * must still be able to force the result to 0. */
+static void st_prod_rec(StNode *nodes, uint64_t v, uint64_t lo, uint64_t hi,
+                        uint64_t l, uint64_t r, StCarry c, int64_t *p, int *ovf, int *hasz) {
+    if (*hasz || r < lo || hi < l) return;    /* a zero already forces the product to 0 */
+    if (l <= lo && hi <= r) {                  /* covered */
+        int64_t np;
+        if (c.asg) {
+            if (c.av == 0) { *hasz = 1; return; }               /* assigned zero -> product 0 */
+            if (st_ipow_ovf(c.av, hi - lo + 1, &np)) { *ovf = 1; return; }
+        } else {
+            const StNode *nd = &nodes[v];
+            if (!(nd->flags & ST_F_PROD_OVF) && nd->prod == 0) { *hasz = 1; return; }  /* range has a zero */
+            if (nd->flags & ST_F_PROD_OVF) { *ovf = 1; return; }
+            np = nd->prod;
+        }
+        if (__builtin_mul_overflow(*p, np, p)) *ovf = 1;
+        return;
+    }
+    uint64_t mid = lo + (hi - lo) / 2;
+    StCarry cc = st_carry_descend(c, &nodes[v]);
+    st_prod_rec(nodes, 2*v,     lo,      mid, l, r, cc, p, ovf, hasz);
+    st_prod_rec(nodes, 2*v + 1, mid + 1, hi,  l, r, cc, p, ovf, hasz);
 }
 
 /* clamp a caller range to [0, n-1]; returns 0 if it is empty/out of range */
@@ -824,10 +974,18 @@ static inline int st_clamp_range(StHandle *h, uint64_t *l, uint64_t *r) {
     return *l <= *r;
 }
 
-/* add delta to every position in [l,r] (caller holds the write lock) */
+/* add delta to every position in [l,r] (caller holds the write lock).  This
+ * permanently gates off the gcd/product monoids (add_used = 1). */
 static void st_range_add_locked(StHandle *h, uint64_t l, uint64_t r, int64_t delta) {
     if (!st_clamp_range(h, &l, &r)) return;
+    h->hdr->add_used = 1;
     st_range_add_rec(st_nodes(h), 1, 0, h->size - 1, l, r, delta);
+}
+
+/* assign value c to every position in [l,r] (caller holds the write lock) */
+static void st_range_assign_locked(StHandle *h, uint64_t l, uint64_t r, int64_t c) {
+    if (!st_clamp_range(h, &l, &r)) return;
+    st_range_assign_rec(st_nodes(h), 1, 0, h->size - 1, l, r, c);
 }
 
 /* sum/min/max over [l,r] into *sum/*mn/*mx (caller holds a lock) */
@@ -835,7 +993,30 @@ static void st_query_locked(StHandle *h, uint64_t l, uint64_t r,
                             int64_t *sum, int64_t *mn, int64_t *mx) {
     *sum = 0; *mn = ST_IDENTITY_MIN; *mx = ST_IDENTITY_MAX;
     if (!st_clamp_range(h, &l, &r)) return;
-    st_query_rec(st_nodes(h), 1, 0, h->size - 1, l, r, 0, sum, mn, mx);
+    StCarry c = { 0, 0, 0 };
+    st_query_rec(st_nodes(h), 1, 0, h->size - 1, l, r, c, sum, mn, mx);
+}
+
+/* gcd over [l,r] (caller holds a lock and has checked add_used == 0) */
+static int64_t st_gcd_locked(StHandle *h, uint64_t l, uint64_t r) {
+    int64_t g = 0;
+    if (!st_clamp_range(h, &l, &r)) return 0;
+    StCarry c = { 0, 0, 0 };
+    st_gcd_rec(st_nodes(h), 1, 0, h->size - 1, l, r, c, &g);
+    return g;
+}
+
+/* product over [l,r]; returns 0 with *ovf=1 on overflow, else the product with
+ * *ovf=0 (empty range -> 1).  Caller holds a lock and has checked add_used == 0. */
+static int64_t st_prod_locked(StHandle *h, uint64_t l, uint64_t r, int *ovf) {
+    int64_t p = 1;
+    int hasz = 0;
+    *ovf = 0;
+    if (!st_clamp_range(h, &l, &r)) return 1;
+    StCarry c = { 0, 0, 0 };
+    st_prod_rec(st_nodes(h), 1, 0, h->size - 1, l, r, c, &p, ovf, &hasz);
+    if (hasz) { *ovf = 0; return 0; }           /* a zero anywhere -> product 0, never an overflow */
+    return *ovf ? 0 : p;
 }
 
 /* value at position i (caller holds a lock); 0 if out of range */
@@ -845,12 +1026,11 @@ static int64_t st_get_locked(StHandle *h, uint64_t i) {
     return s;
 }
 
-/* set position i to val (caller holds the write lock) */
+/* set position i to val (caller holds the write lock).  Uses assign, not add, so
+ * the gcd/product monoids stay valid across point updates. */
 static void st_set_locked(StHandle *h, uint64_t i, int64_t val) {
     if (h->n == 0 || i >= h->n) return;
-    int64_t cur = st_get_locked(h, i);
-    int64_t delta = val - cur;
-    if (delta) st_range_add_rec(st_nodes(h), 1, 0, h->size - 1, i, i, delta);
+    st_range_assign_rec(st_nodes(h), 1, 0, h->size - 1, i, i, val);
 }
 
 /* reset every position to 0 (caller holds the write lock) */
@@ -859,7 +1039,8 @@ static inline void st_clear_locked(StHandle *h) {
     uint64_t node_count = 2 * h->size;
     uint64_t nmax = st_nodes_max(h);    /* Layer B: clamp to the mapping */
     if (node_count > nmax) node_count = nmax;
-    memset(nodes, 0, (size_t)(node_count * sizeof(StNode)));   /* sum/min/max/lazy all 0 */
+    memset(nodes, 0, (size_t)(node_count * sizeof(StNode)));   /* every aggregate + lazy = 0 */
+    h->hdr->add_used = 0;               /* a cleared tree is gcd/product-capable again */
 }
 
 #endif /* ST_H */

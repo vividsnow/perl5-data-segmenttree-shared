@@ -1,7 +1,7 @@
 package Data::SegmentTree::Shared;
 use strict;
 use warnings;
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 require XSLoader;
 XSLoader::load('Data::SegmentTree::Shared', $VERSION);
 
@@ -13,7 +13,7 @@ __END__
 
 =head1 NAME
 
-Data::SegmentTree::Shared - shared-memory segment tree (range-add, range sum/min/max)
+Data::SegmentTree::Shared - shared-memory segment tree (range add/assign, range sum/min/max/gcd/product)
 
 =head1 SYNOPSIS
 
@@ -25,11 +25,14 @@ Data::SegmentTree::Shared - shared-memory segment tree (range-add, range sum/min
     $st->set(10, 42);              # position 10 := 42
     $st->add(10, 5);               # position 10 += 5  (now 47)
     $st->range_add(0, 99, 3);      # add 3 to every position in [0, 99]
+    $st->range_assign(0, 99, 7);   # set every position in [0, 99] to 7
 
     my $s = $st->sum(0, 99);       # sum over a range
     my $lo = $st->min(0, 99);      # minimum over a range
     my $hi = $st->max(0, 99);      # maximum over a range
     my $q = $st->query(0, 99);     # { sum, min, max, count } in one call
+    my $g = $st->gcd(0, 99);       # gcd over a range   (assign/set-only trees)
+    my $p = $st->product(0, 99);   # product over a range (assign/set-only trees)
 
     # share the array across processes via a backing file
     my $shared = Data::SegmentTree::Shared->new("/tmp/array.st", 1000);
@@ -60,6 +63,27 @@ Values and range sums are signed 64-bit integers; feeding values large enough
 that a range sum exceeds the 64-bit range overflows (wraps), as with any native
 integer accumulator.
 
+=head2 Range assign and the gcd/product monoids
+
+Alongside C<range_add>, the tree supports B<range_assign> -- set every position of
+a range to a constant in O(log n) (a second lazy tag, composed correctly with
+C<range_add>). It also offers two extra range monoids, B<gcd> and B<product>.
+
+These monoids come with a hard rule dictated by the math: B<gcd and product cannot
+be maintained under C<range_add>> (there is no way to recover the gcd or product
+of C<{a+d, b+d, ...}> from the gcd/product of C<{a, b, ...}>). So C<gcd> and
+C<product> are exact only while the tree has been built with B<assign/set updates
+only>; the first C<range_add> or C<add> B<permanently gates them off> (C<gcd>/
+C<product> then croak until C<clear>). Use C<< $st->monoids_valid >> to check.
+Point updates via C<set> use assign internally, so they keep the monoids valid.
+C<product> additionally croaks if the product of the queried range overflows a
+signed 64-bit integer.
+
+B<On-disk format>: version 0.02 widened the node to carry the assign tag and the
+gcd/product aggregates, so a segment-tree B<file written by 0.01 cannot be opened
+by 0.02> (it is rejected on attach); rebuild it. These trees are normally
+ephemeral compute structures, so this only matters if you persisted one.
+
 =head1 METHODS
 
 =head2 Constructors
@@ -78,14 +102,18 @@ for cross-user sharing; it defaults to C<0600> (owner-only).
 
 =head2 Updates
 
-    $st->set($i, $value);          # position $i := $value
-    my $new = $st->add($i, $delta); # position $i += $delta; returns the new value
-    $st->range_add($l, $r, $delta); # add $delta to every position in [$l, $r]
+    $st->set($i, $value);              # position $i := $value
+    my $new = $st->add($i, $delta);     # position $i += $delta; returns the new value
+    $st->range_add($l, $r, $delta);     # add $delta to every position in [$l, $r]
+    $st->range_assign($l, $r, $value);  # set every position in [$l, $r] to $value
 
 C<set> assigns a single position; C<add> adds a delta to a single position and
 returns its new value; C<range_add> adds a delta to every position in the
-inclusive range C<[$l, $r]> in O(log n) (its defining feature). All indices are
-0-based and croak if out of range; C<range_add> croaks if C<$l > $r>.
+inclusive range C<[$l, $r]>, and C<range_assign> sets every position in the range
+to a constant -- each in O(log n) via lazy propagation. All indices are 0-based
+and croak if out of range; the range forms croak if C<$l > $r>. Note that
+C<range_add>/C<add> gate off the gcd/product monoids (see below), while C<set>/
+C<range_assign> do not.
 
 =head2 Queries
 
@@ -94,21 +122,30 @@ inclusive range C<[$l, $r]> in O(log n) (its defining feature). All indices are
     my $lo = $st->min($l, $r);     # minimum over [$l, $r]
     my $hi = $st->max($l, $r);     # maximum over [$l, $r]
     my $q = $st->query($l, $r);    # { sum, min, max, count } in one locked call
+    my $g = $st->gcd($l, $r);      # gcd over [$l, $r]     (assign/set-only trees)
+    my $p = $st->product($l, $r);  # product over [$l, $r] (assign/set-only trees)
 
 C<get> returns a single position's value. C<sum>, C<min>, and C<max> return one
 aggregate over the inclusive range C<[$l, $r]>. C<query> returns all of them at
 once as a hash reference C<< { sum, min, max, count } >> (C<count> is
 C<$r - $l + 1>), computed under a single read lock so the four values are
-mutually consistent. Ranges croak if an index is out of range or C<$l > $r>.
+mutually consistent. C<gcd> returns the greatest common divisor of C<|values|>
+over the range (0 for an all-zero range), and C<product> their product; both
+require an B<assign/set-only> tree and croak once any C<range_add>/C<add> has run
+(see L</"Range assign and the gcd/product monoids">), and C<product> also croaks
+on 64-bit overflow. Ranges croak if an index is out of range or C<$l > $r>.
 
 =head2 Introspection and lifecycle
 
     $st->size;          # n, the number of positions
+    $st->monoids_valid; # true if gcd/product are still usable (no range_add yet)
     $st->clear;         # reset every position to 0
     $st->stats;         # { n, size, tree_size, ops, mmap_size }
     $st->path; $st->memfd; $st->sync; $st->unlink;
 
-C<clear> resets every position to 0. C<sync> flushes the mapping to its backing
+C<monoids_valid> reports whether C<gcd>/C<product> are currently usable (false once
+a C<range_add>/C<add> has gated them off). C<clear> resets every position to 0 and
+re-enables the monoids. C<sync> flushes the mapping to its backing
 store (a no-op for anonymous and memfd trees); C<unlink> removes the backing file
 (also callable as C<< Class->unlink($path) >>); C<path> returns the backing path
 (C<undef> for anonymous, memfd, or fd-reopened trees) and C<memfd> the backing

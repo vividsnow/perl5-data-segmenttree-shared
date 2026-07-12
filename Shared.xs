@@ -111,6 +111,7 @@ add(self, i, delta)
   CODE:
     POS(pos, i);
     st_rwlock_wrlock(h);
+    h->hdr->add_used = 1;                   /* a point add breaks gcd/product too */
     st_range_add_rec(st_nodes(h), 1, 0, h->size - 1, (uint64_t)pos, (uint64_t)pos, (int64_t)delta);
     v = st_get_locked(h, (uint64_t)pos);   /* new value, under the same lock */
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
@@ -133,6 +134,23 @@ range_add(self, l, r, delta)
     if (lo > hi) croak("Data::SegmentTree::Shared->range_add: l (%" UVuf ") > r (%" UVuf ")", lo, hi);
     st_rwlock_wrlock(h);
     st_range_add_locked(h, (uint64_t)lo, (uint64_t)hi, (int64_t)delta);
+    __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
+    st_rwlock_wrunlock(h);
+
+void
+range_assign(self, l, r, value)
+    SV *self
+    SV *l
+    SV *r
+    IV value
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    POS(lo, l);
+    POS(hi, r);
+    if (lo > hi) croak("Data::SegmentTree::Shared->range_assign: l (%" UVuf ") > r (%" UVuf ")", lo, hi);
+    st_rwlock_wrlock(h);
+    st_range_assign_locked(h, (uint64_t)lo, (uint64_t)hi, (int64_t)value);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     st_rwlock_wrunlock(h);
 
@@ -234,6 +252,62 @@ query(self, l, r)
         hv_stores(hv, "count", newSVuv((UV)(hi - lo + 1)));
         RETVAL = newRV_noinc((SV *)hv);
     }
+  OUTPUT:
+    RETVAL
+
+# gcd/product monoids: valid only while no range_add/add has run on the tree
+# (they provably cannot be maintained under range-add).  product croaks on int64
+# overflow.  Both read the add_used gate under the lock and croak after unlock.
+UV
+gcd(self, l, r)
+    SV *self
+    SV *l
+    SV *r
+  PREINIT:
+    EXTRACT(self);
+    int64_t g = 0; int used;
+  CODE:
+    POS(lo, l);
+    POS(hi, r);
+    if (lo > hi) croak("Data::SegmentTree::Shared->gcd: l > r");
+    st_rwlock_rdlock(h);
+    used = (int)h->hdr->add_used;
+    if (!used) g = st_gcd_locked(h, (uint64_t)lo, (uint64_t)hi);
+    st_rwlock_rdunlock(h);
+    if (used) croak("Data::SegmentTree::Shared->gcd: unavailable after range_add/add (gcd does not compose with range-add); use range_assign/set, or clear()");
+    RETVAL = (UV)g;   /* gcd is a non-negative magnitude; UV also holds the 2^63 case (all INT64_MIN) */
+  OUTPUT:
+    RETVAL
+
+IV
+product(self, l, r)
+    SV *self
+    SV *l
+    SV *r
+  PREINIT:
+    EXTRACT(self);
+    int64_t p = 0; int used; int ovf = 0;
+  CODE:
+    POS(lo, l);
+    POS(hi, r);
+    if (lo > hi) croak("Data::SegmentTree::Shared->product: l > r");
+    st_rwlock_rdlock(h);
+    used = (int)h->hdr->add_used;
+    if (!used) p = st_prod_locked(h, (uint64_t)lo, (uint64_t)hi, &ovf);
+    st_rwlock_rdunlock(h);
+    if (used) croak("Data::SegmentTree::Shared->product: unavailable after range_add/add; use range_assign/set, or clear()");
+    if (ovf)  croak("Data::SegmentTree::Shared->product: overflowed a signed 64-bit integer over [%" UVuf ", %" UVuf "]", lo, hi);
+    RETVAL = (IV)p;
+  OUTPUT:
+    RETVAL
+
+int
+monoids_valid(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = h->hdr->add_used ? 0 : 1;   /* gcd/product usable? */
   OUTPUT:
     RETVAL
 
