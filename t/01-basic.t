@@ -174,7 +174,7 @@ unlink $path;
     is $r->get(0), 10, 'reopen: value persisted (0*2 + 10)';
     is $r->get(50), 110, 'reopen: value persisted (50*2 + 10)';
     is $r->get(100), 200, 'reopen: value outside the range_add persisted';
-    is $r->sum(0, 199), $r->sum(0, 199), 'reopen: queries work';
+    is $r->sum(0, 199), 40800, 'reopen: queries work (2*sum(0..199) + 10*100)';
 }
 { open my $fh, '>', $path or die $!; print $fh "junk"; close $fh; }
 ok !eval { Data::SegmentTree::Shared->new($path, 200); 1 }, 'corrupt file rejected';

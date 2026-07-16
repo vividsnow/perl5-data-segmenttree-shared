@@ -9,7 +9,8 @@
     if (!sv_isobject(sv) || !sv_derived_from(sv, "Data::SegmentTree::Shared")) \
         croak("Expected a Data::SegmentTree::Shared object"); \
     StHandle *h = INT2PTR(StHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Attempted to use a destroyed Data::SegmentTree::Shared object")
+    if (!h) croak("Attempted to use a destroyed Data::SegmentTree::Shared object"); \
+    sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
@@ -35,12 +36,15 @@ new(class, path = &PL_sv_undef, n = 0, ...)
   PREINIT:
     char errbuf[ST_ERR_BUFLEN];
   CODE:
-    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     if (n < 1)
         croak("Data::SegmentTree::Shared->new: number of positions must be >= 1");
     /* Optional 4th arg: file mode for a newly-created file-backed segment
-     * (default 0600, owner-only). Pass e.g. 0660 for cross-user sharing. */
+     * (default 0600, owner-only). Pass e.g. 0660 for cross-user sharing.
+     * Resolve it before capturing the path PV: SvGETMAGIC on ST(3) may
+     * realloc/free the PV that SvPV_nolen(path) would return. */
     mode_t mode = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? (mode_t)SvUV(ST(3)) : 0600;
+    /* capture the path PV last, after all get-magic on other args has run */
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     StHandle *h = st_create(p, (uint64_t)n, mode, errbuf);
     if (!h) croak("Data::SegmentTree::Shared->new: %s", errbuf);
     MAKE_OBJ(class, h);
@@ -111,7 +115,7 @@ add(self, i, delta)
   CODE:
     POS(pos, i);
     st_rwlock_wrlock(h);
-    h->hdr->add_used = 1;                   /* a point add breaks gcd/product too */
+    __atomic_store_n(&h->hdr->add_used, 1, __ATOMIC_RELAXED);   /* a point add breaks gcd/product too; atomic: monoids_valid reads it unlocked */
     st_range_add_rec(st_nodes(h), 1, 0, h->size - 1, (uint64_t)pos, (uint64_t)pos, (int64_t)delta);
     v = st_get_locked(h, (uint64_t)pos);   /* new value, under the same lock */
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
@@ -271,7 +275,7 @@ gcd(self, l, r)
     POS(hi, r);
     if (lo > hi) croak("Data::SegmentTree::Shared->gcd: l > r");
     st_rwlock_rdlock(h);
-    used = (int)h->hdr->add_used;
+    used = (int)__atomic_load_n(&h->hdr->add_used, __ATOMIC_RELAXED);
     if (!used) g = st_gcd_locked(h, (uint64_t)lo, (uint64_t)hi);
     st_rwlock_rdunlock(h);
     if (used) croak("Data::SegmentTree::Shared->gcd: unavailable after range_add/add (gcd does not compose with range-add); use range_assign/set, or clear()");
@@ -292,7 +296,7 @@ product(self, l, r)
     POS(hi, r);
     if (lo > hi) croak("Data::SegmentTree::Shared->product: l > r");
     st_rwlock_rdlock(h);
-    used = (int)h->hdr->add_used;
+    used = (int)__atomic_load_n(&h->hdr->add_used, __ATOMIC_RELAXED);
     if (!used) p = st_prod_locked(h, (uint64_t)lo, (uint64_t)hi, &ovf);
     st_rwlock_rdunlock(h);
     if (used) croak("Data::SegmentTree::Shared->product: unavailable after range_add/add; use range_assign/set, or clear()");
@@ -307,7 +311,7 @@ monoids_valid(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    RETVAL = h->hdr->add_used ? 0 : 1;   /* gcd/product usable? */
+    RETVAL = __atomic_load_n(&h->hdr->add_used, __ATOMIC_RELAXED) ? 0 : 1;   /* gcd/product usable? (unlocked read -> atomic) */
   OUTPUT:
     RETVAL
 

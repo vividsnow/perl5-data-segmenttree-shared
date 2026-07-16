@@ -94,7 +94,7 @@ ephemeral compute structures, so this only matters if you persisted one.
     my $st = Data::SegmentTree::Shared->new_from_fd($fd);
 
 C<$n> is the number of positions (at least 1, up to 2^24); every position starts
-at 0. Memory is C<2 * next_pow2(n) * 32> bytes plus a fixed header. C<new> and
+at 0. Memory is C<2 * next_pow2(n) * 64> bytes plus a fixed header. C<new> and
 C<new_memfd> croak on a C<$n> below 1 or above 2^24. When reopening an existing
 file or memfd the stored C<$n> wins and the caller's argument is ignored. An
 optional file B<mode> may be passed as the last argument to C<new> (e.g. C<0660>)
@@ -170,9 +170,27 @@ the mapping.
 =head1 CRASH SAFETY
 
 Mutation is guarded by a futex-based write-preferring rwlock with PID-encoded
-ownership and dead-owner recovery. Each update is a short bounded O(log n) tree
-walk, so a crash leaves the array consistent up to the last completed operation.
-B<Limitation>: PID reuse is not detected (very unlikely in practice).
+ownership and dead-owner recovery. Dead-owner recovery restores lock
+B<availability> only. Each mutation is a multi-store O(log n) tree walk with no
+commit protocol, so a writer killed mid-update leaves that update partially
+applied: the tree can be left internally inconsistent (a later C<query> may
+disagree with the individual C<get> values), and recovery neither detects nor
+repairs the torn update. Treat a crash during a mutation as leaving the tree in
+an undefined state, and rebuild from a trusted source if you need consistency
+across crashes. B<Limitation>: PID reuse is not detected (very unlikely in
+practice).
+
+Reader-slot exhaustion (slotless readers): dead-process recovery attributes a
+crashed lock holder's contribution through its reader-slot. The slot table holds
+1024 entries (one per concurrent reader process). If more than that many reader
+processes share one mapping at once, a reader that cannot claim a slot proceeds
+"slotless" -- it still takes the read lock but leaves no per-process record. If
+such a slotless reader is then killed while holding the read lock, its share of
+the lock cannot be attributed to a dead process, so writer recovery cannot
+reclaim it and writers may block until the mapping is recreated. Reaching this
+needs more than 1024 concurrent reader processes on one mapping plus a crash in
+the brief read-lock window; the dead-process slot reclaim keeps the table from
+filling with stale entries, so in practice it is very unlikely.
 
 =head1 SEE ALSO
 

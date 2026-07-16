@@ -116,6 +116,18 @@ srand($seed);
     is $t->gcd(0, 15), 0, 'gcd of all-zero cleared tree is 0';
 }
 
+# ---- gcd/product gating around POINT add() (oracle for the add_used=1 gate in add()) ----
+{
+    my $t = Data::SegmentTree::Shared->new(undef, 8);
+    $t->range_assign(0, 7, 6);
+    ok $t->monoids_valid, 'monoids valid after assign (point-add gate)';
+    is $t->gcd(0, 7), 6, 'gcd before point add()';
+    $t->add(3, 1);                                # POINT add() must also gate off gcd/product
+    ok !$t->monoids_valid, 'point add() invalidates monoids';
+    eval { $t->gcd(0, 7) };     like $@, qr/unavailable after range_add/, 'gcd croaks after point add()';
+    eval { $t->product(0, 7) }; like $@, qr/unavailable after range_add/, 'product croaks after point add()';
+}
+
 # ---- product basics + overflow ----
 {
     my $t = Data::SegmentTree::Shared->new(undef, 64);
