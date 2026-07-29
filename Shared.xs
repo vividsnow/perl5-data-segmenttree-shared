@@ -32,13 +32,12 @@
     sv_bless(ref, gv_stashpv(class, GV_ADD)); \
     RETVAL = ref
 
-/* validate + fetch a 0-based position, croaking on out-of-range (h->n is the
- * process-local, attach-validated position count -- not the peer-writable header).
- * SvUV(sv) runs get-magic (a tied/overloaded position argument executes Perl that
- * can DESTROY or replace the invocant), so REEXTRACT(self) re-validates the handle
- * BEFORE the h->n dereference below -- the guard lives inside the macro precisely
- * because POS itself dereferences h, so no h access may sit between the SvUV and
- * the re-check.  Every method that uses POS names its invocant `self`. */
+/* Validate + fetch a 0-based position, croaking on out-of-range (h->n is the
+ * process-local, attach-validated count -- not the peer-writable header).
+ * REEXTRACT(self) must run BEFORE the h->n dereference below (SvUV(sv) can run
+ * Perl that destroys/replaces the invocant -- see REEXTRACT above) -- the
+ * guard lives inside this macro because POS itself dereferences h.  Every
+ * method that uses POS names its invocant `self`. */
 #define POS(nm, sv) \
     UV nm = SvUV(sv); \
     REEXTRACT(self); \
@@ -62,7 +61,7 @@ new(class, path = &PL_sv_undef, n = 0, ...)
      * (default 0600, owner-only). Pass e.g. 0660 for cross-user sharing.
      * Resolve it before capturing the path PV: SvGETMAGIC on ST(3) may
      * realloc/free the PV that SvPV_nolen(path) would return. */
-    mode_t mode = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? (mode_t)SvUV(ST(3)) : 0600;
+    mode_t mode = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? ((mode_t)SvUV(ST(3)) & 0777) : 0600;   /* mask off setuid/setgid/sticky bits on a data file */
     /* capture the path PV last, after all get-magic on other args has run */
     const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     StHandle *h = st_create(p, (uint64_t)n, mode, errbuf);
@@ -352,7 +351,7 @@ size(self)
   PREINIT:
     EXTRACT(self);
   CODE:
-    RETVAL = (UV)h->hdr->n;
+    RETVAL = (UV)h->n;   /* attach-validated cache, not the peer-writable header */
   OUTPUT:
     RETVAL
 
@@ -364,8 +363,8 @@ stats(self)
   CODE:
     {
         uint64_t n, sz, ops;
-        n   = h->hdr->n;
-        sz  = h->hdr->size;
+        n   = h->n;      /* attach-validated caches, not the peer-writable header */
+        sz  = h->size;
         ops = __atomic_load_n(&h->hdr->stat_ops, __ATOMIC_RELAXED);
         HV *hv = newHV();
         hv_stores(hv, "n",         newSVuv((UV)n));
